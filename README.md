@@ -88,20 +88,3 @@ python src/train_baseline.py \
 This fine-tunes an ImageNet-pretrained ResNet-18 on just your 15% labeled
 slice, early-stops on validation F1, and reports final test accuracy/F1/
 precision/recall — saved to `outputs/metrics_baseline.json`.
-
-## Day 1 checklist
-
-- [ ] Dataset downloaded and merged into `data/raw/<class>/`
-- [ ] `prepare_data.py` run, class balance verified across all 3 splits
-- [ ] Baseline model trained, `outputs/metrics_baseline.json` populated
-- [ ] Record these baseline numbers — you'll need them for Day 4's comparison table:
-
-| Setup                          | Accuracy | F1 | Precision | Recall |
-|---------------------------------|----------|----|-----------|--------|
-| Supervised (15% labeled only)   |          |    |           |        |
-
-## What's next (Day 2 preview)
-
-Day 2 reuses `outputs/manifests/unlabeled.csv` and the baseline checkpoint
-at `outputs/checkpoints/baseline_best.pt` as the "teacher" model — no need
-to touch Day 1's code again, just build on top of it.
