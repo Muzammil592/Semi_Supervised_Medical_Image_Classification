@@ -181,6 +181,3 @@ it's a finding. Common causes worth investigating and writing up:
 - **Threshold too low/high**: use the sweep plot to see if a different
   threshold changes the outcome.
 
-This diagnosis is exactly what Day 3 (FixMatch) is designed to fix — weak/
-strong augmentation consistency is more robust to a weak teacher than raw
-confidence thresholding.
