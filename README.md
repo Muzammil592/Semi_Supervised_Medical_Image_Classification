@@ -89,19 +89,81 @@ This fine-tunes an ImageNet-pretrained ResNet-18 on just your 15% labeled
 slice, early-stops on validation F1, and reports final test accuracy/F1/
 precision/recall — saved to `outputs/metrics_baseline.json`.
 
-## Day 1 checklist
+# Day 2 — Pseudo-Labeling Pipeline (Self-Training)
 
-- [ ] Dataset downloaded and merged into `data/raw/<class>/`
-- [ ] `prepare_data.py` run, class balance verified across all 3 splits
-- [ ] Baseline model trained, `outputs/metrics_baseline.json` populated
-- [ ] Record these baseline numbers — you'll need them for Day 4's comparison table:
+**Goal today:** use the Day 1 teacher model to label the unlabeled pool,
+keep only confident predictions, retrain, and beat the baseline.
 
-| Setup                          | Accuracy | F1 | Precision | Recall |
-|---------------------------------|----------|----|-----------|--------|
-| Supervised (15% labeled only)   |          |    |           |        |
+Run these on the same machine/notebook where you did Day 1 — they expect
+`outputs/manifests/` and `outputs/checkpoints/baseline_best.pt` to already exist.
 
-## What's next (Day 2 preview)
+## 1. Score the unlabeled pool with the teacher model
 
-Day 2 reuses `outputs/manifests/unlabeled.csv` and the baseline checkpoint
-at `outputs/checkpoints/baseline_best.pt` as the "teacher" model — no need
-to touch Day 1's code again, just build on top of it.
+```bash
+python src/generate_pseudo_labels.py \
+    --manifest_dir outputs/manifests \
+    --ckpt_path outputs/checkpoints/baseline_best.pt \
+    --threshold 0.95
+```
+
+This prints diagnostics like:
+```
+Teacher accuracy on ALL unlabeled images:  91.2%
+Kept (>= threshold):                        612 / 980 (62.4%)
+Teacher accuracy on KEPT (pseudo-label) set: 98.1%
+```
+That gap (91.2% → 98.1%) is the entire point of thresholding: you trade
+coverage for cleaner labels. Note both numbers — they go straight into your
+README's methodology section.
+
+It writes:
+- `outputs/manifests/pseudo_labels_all.csv` — every unlabeled image scored
+- `outputs/manifests/pseudo_labels_kept.csv` — only the ones that passed threshold, ready to train on
+
+## 2. (Optional but recommended) Sweep the threshold
+
+```bash
+python src/analyze_pseudo_labels.py --manifest_dir outputs/manifests
+```
+
+Produces `outputs/figures/threshold_sweep.png` (coverage vs. pseudo-label
+accuracy at several thresholds) and `confidence_histogram.png` (correct vs.
+incorrect predictions by confidence). These two plots are the kind of thing
+that makes a portfolio project look rigorous instead of arbitrary — use them
+to justify your choice of 0.95 in the README rather than just asserting it.
+
+## 3. Retrain on labeled + pseudo-labeled data
+
+```bash
+python src/train_pseudolabel.py \
+    --manifest_dir outputs/manifests \
+    --epochs 15 --batch_size 32 --lr 1e-4
+```
+
+Trains a fresh ResNet-18 on (original labeled minus val split) + (kept
+pseudo-labels), validates on real labels only, evaluates on the same
+`test.csv` as Day 1. Saves `outputs/metrics_pseudolabel.json`.
+
+## Update your comparison table
+
+| Setup                                  | Accuracy | F1 | Precision | Recall |
+|------------------------------------------|----------|----|-----------|--------|
+| Supervised (15% labeled only) — Day 1     |          |    |           |        |
+| Pseudo-labeling (15% + high-conf pseudo) — Day 2 |    |    |           |        |
+
+If pseudo-labeling *doesn't* beat the baseline, that's not a failure —
+it's a finding. Common causes worth investigating and writing up:
+- **Confirmation bias**: the teacher is weak (only 15% data), so its
+  confident mistakes get reinforced. Check the "pseudo-label accuracy on
+  kept" number from step 1 — if it's not meaningfully higher than overall
+  teacher accuracy, thresholding isn't filtering out much.
+- **Class imbalance compounding**: if the teacher is biased toward
+  PNEUMONIA (the majority class), pseudo-labels will skew the same way,
+  making the student more imbalanced, not less. Check the
+  `pred_class_name` value counts printed in step 1.
+- **Threshold too low/high**: use the sweep plot to see if a different
+  threshold changes the outcome.
+
+This diagnosis is exactly what Day 3 (FixMatch) is designed to fix — weak/
+strong augmentation consistency is more robust to a weak teacher than raw
+confidence thresholding.
