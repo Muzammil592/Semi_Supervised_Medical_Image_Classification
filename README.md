@@ -1,195 +1,139 @@
 # Semi-Supervised Medical Image Classification via Pseudo-Labeling & FixMatch
 
-Training a strong image classifier usually assumes you have thousands of
-**labeled** examples. In real deployments — especially medical imaging —
-that assumption breaks: labeling a chest X-ray requires a radiologist's
-time, and that time is expensive and scarce. This project asks a more
-realistic question:
+Training a good image classifier usually assumes you have thousands of labeled examples. In medical imaging that assumption falls apart fast: labeling a chest X-ray takes a radiologist's time, and that time is expensive. This project looks at a more realistic question. How much of that labeling cost can you claw back by using techniques that squeeze signal out of unlabeled data instead?
 
-> **How much of that labeling cost can we recover using techniques that
-> exploit unlabeled data instead?**
+It builds a semi-supervised learning pipeline that trains on 15% labeled data plus a much larger pool of unlabeled data, and compares two approaches to doing that, pseudo-labeling and FixMatch, against a plain supervised baseline trained on that same small labeled slice.
 
-It builds an end-to-end semi-supervised learning (SSL) pipeline that trains
-on **15% labeled data + 70% unlabeled data**, and benchmarks two SSL
-techniques — pseudo-labeling and FixMatch — against a supervised-only
-baseline on the same small labeled slice.
+## What's here
 
----
+- A data pipeline that splits a dataset into 15% labeled, 70% unlabeled, and 15% held-out test data, with stratified sampling so class balance holds across all three
+- A supervised ResNet-18 baseline trained only on the labeled slice
+- A pseudo-labeling / self-training loop: train a teacher on the labeled data, score the unlabeled pool, keep only confident predictions, retrain on the combined set
+- A FixMatch implementation using weak and strong augmentation with a confidence-masked consistency loss
+- A fully supervised reference model trained on 100% of the data, used as a ceiling to measure how much of the gap the SSL techniques actually close
+- Benchmarking scripts: precision-recall curves, confusion matrices, and t-SNE/UMAP feature embedding comparisons
+- A hyperparameter ablation runner
+- A Gradio demo where you can upload an X-ray and compare predictions across all four trained models
 
-## Status
+## Why this setup
 
-| Stage | Description | Status |
-|---|---|---|
-| 1 | Data preparation & supervised baseline | ✅ Implemented |
-| 2 | Pseudo-labeling self-training | ✅ Implemented |
-| 3 | FixMatch (consistency regularization) | ✅ Implemented |
-| 4 | Benchmarking, ablations, embedding visualizations | ✅ Implemented |
-| 5 | Gradio demo app + final documentation | 🔜 In progress |
+Supervised learning is label-hungry, and in domains like medical imaging every label costs an expert's time. That caps how much labeled data any team can realistically gather. Unlabeled images, on the other hand, tend to be cheap and plentiful (raw scans sitting in an archive, for example).
 
-All code below has been written and syntax-verified. Reported metrics are
-pending a full training run on GPU hardware (see [Reproducing Results](#reproducing-results)) — this README will be updated with real numbers as each stage completes.
+Semi-supervised learning tries to close that gap. Bootstrap a model on a small labeled set, then use that model, combined with some regularization trick, to pull additional training signal out of a much larger unlabeled pool.
 
----
+This project compares four points on that spectrum:
 
-## Problem Statement
+1. **Supervised baseline.** Train on the 15% labeled slice only. This is the realistic floor for a team that can't afford more annotation.
+2. **Pseudo-labeling.** Use the baseline as a teacher, label the unlabeled pool, keep only high-confidence predictions, and retrain a student on labeled plus pseudo-labeled data.
+3. **FixMatch.** Instead of committing to pseudo-labels once, regenerate them every batch from a weakly augmented view, and require the model to reproduce that same prediction on a strongly (heavily) augmented view of the same image.
+4. **Fully supervised ceiling.** Train on all the data with real labels, just to see how much performance was actually on the table.
 
-Supervised deep learning is label-hungry. In domains like medical imaging,
-every label costs an expert's time, which caps how much labeled data a
-team can realistically gather. Meanwhile, *unlabeled* images (raw scans
-sitting in a hospital's archive, for instance) are comparatively cheap to
-collect.
-
-Semi-supervised learning tries to close that gap: use a small labeled set
-to bootstrap a model, then use that model — combined with clever
-regularization — to extract additional training signal from a much larger
-pool of unlabeled data.
-
-This project implements and compares four points on that spectrum:
-
-1. **Supervised baseline** — train only on the 15% labeled slice. This is
-   the realistic floor for a team that can't afford more annotation.
-2. **Pseudo-labeling (self-training)** — use the baseline as a teacher,
-   label the unlabeled pool, keep only high-confidence predictions, retrain
-   on labeled + pseudo-labeled data.
-3. **FixMatch (consistency regularization)** — instead of committing to
-   pseudo-labels once, regenerate them every training batch from a weakly
-   augmented view, and require the model to reproduce the same prediction
-   under a strongly augmented (heavily distorted) view of the same image.
-4. **Fully supervised ceiling** — train on 100% of the data with real
-   labels, as a reference point for how much of the gap SSL actually closes.
-
-The question this project answers isn't just "does SSL help" — it's
-**"which SSL technique holds up better when the labeling budget is small
-and the teacher model itself is imperfect, and how close does it get to
-what full annotation would have bought us,"** which is the realistic
-constraint most teams actually face.
-
----
+The interesting question isn't just "does SSL help." It's which technique holds up better when the labeling budget is small and the teacher model itself is far from perfect, and how much of the gap to full supervision it manages to close.
 
 ## Dataset
 
-**Chest X-Ray Images (Pneumonia)** — [Kaggle, paultimothymooney](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia)
+**Chest X-Ray Images (Pneumonia)**, from Kaggle (`paultimothymooney/chest-xray-pneumonia`).
 
-- Binary classification: `NORMAL` vs. `PNEUMONIA`
-- ~5,800 images total, natural class imbalance (~73% pneumonia)
-- Chosen because it's a realistic, widely-recognized medical imaging
-  benchmark, small enough to iterate on quickly, and large enough that a
-  15% labeled slice is still a few hundred images — a meaningfully
-  data-constrained regime rather than a toy split.
+Binary classification, NORMAL vs. PNEUMONIA, roughly 5,800 images total, with a natural class imbalance (about 73% pneumonia). It's a widely recognized medical imaging benchmark, small enough to iterate on quickly, and large enough that a 15% labeled slice still means a few hundred images rather than a toy split.
 
-The dataset's default train/val/test folders are merged and re-split by
-this project's own pipeline (see below) to control exactly how much data
-is labeled vs. unlabeled vs. held out, with stratified sampling to
-preserve class balance across all three splits.
+The dataset's default train/val/test folders get merged and re-split by this project's own pipeline, so the labeled/unlabeled/test proportions are controlled directly rather than inherited from the original split.
 
----
+## How the training loss works
 
-## Methodology
+For the pseudo-labeling stage, a confidence threshold (default 0.95) decides which of the teacher's predictions get treated as labels.
 
-### 1. Data split
-A single stratified split produces:
-- **15% labeled** — real labels, used for supervised training
-- **70% unlabeled** — labels hidden from the model; a ground-truth copy is
-  retained *only* for diagnostics (measuring pseudo-label accuracy), never
-  fed into any loss function
-- **15% test** — held out untouched until final evaluation, shared across
-  all three setups for a fair comparison
-
-### 2. Supervised baseline
-ImageNet-pretrained **ResNet-18**, fine-tuned on the 15% labeled slice
-only. This is the number every SSL technique needs to beat.
-
-### 3. Pseudo-labeling (self-training)
-The baseline model acts as a **teacher**: it scores every unlabeled image,
-and predictions with confidence ≥ 0.95 are treated as labels. A fresh
-**student** model is then trained on labeled + high-confidence
-pseudo-labeled data. A threshold sweep (coverage vs. pseudo-label accuracy)
-is used to justify the confidence cutoff rather than picking it arbitrarily.
-
-### 4. FixMatch (consistency regularization)
-Addresses pseudo-labeling's main weakness — a weak teacher's *confident
-mistakes* get permanently baked into the training set. FixMatch instead:
-- Generates a pseudo-label from a **weakly** augmented view (flip + small
-  shift), every batch, from the current (constantly improving) model
-- Only keeps it if confidence ≥ threshold
-- Requires the model to predict that same label from a **strongly**
-  augmented view (RandAugment + Cutout-style erasing) of the same image
+For FixMatch, the loss combines a normal supervised term with a masked consistency term:
 
 ```
-loss = CE(labeled)  +  λ_u · mean( CE(strong_view, pseudo_label) · mask )
+loss = CE(labeled)  +  lambda_u * mean( CE(strong_view, pseudo_label) * mask )
 ```
 
-This couples "is the model confident?" with "is the model *consistent*
-under distortion?" — a stricter, self-correcting bar than a static
-confidence threshold alone.
+where the pseudo-label comes from the weakly augmented view (no gradient), and the mask zeroes out any sample whose confidence falls below the threshold. The strong view has to reproduce that label anyway, which is a stricter bar than a static confidence cutoff alone, since the model has to survive real distortion and not just agree with itself.
 
-### 5. Fully supervised reference ceiling
-Trains on the entire pool — the original 15% labeled data plus the 70%
-"unlabeled" set, using its hidden ground-truth labels as if they had been
-annotated all along. This isn't a technique to deploy (the whole premise
-of the project is that you don't have these labels); it's a benchmark that
-answers "how much performance is actually on the table," so the SSL
-results can be read as *percent of the labeling-cost gap closed*, not just
-raw accuracy numbers in isolation.
+## Architecture
 
-### 6. Benchmarking & visualization
-All four checkpoints are evaluated on the same held-out test set and
-compared via:
-- A **grouped bar chart** across accuracy/F1/precision/recall
-- **Precision-recall curves** overlaid for all four setups (more
-  informative than accuracy alone given the dataset's class imbalance)
-- **Confusion matrices** side by side, to check which technique reduces
-  costlier error types (e.g. pneumonia misclassified as normal)
-- **t-SNE/UMAP projections** of the penultimate-layer features, comparing
-  the baseline's learned representation against an SSL model's — the
-  visual test of whether the unlabeled data actually improved the
-  features, not just the final decision boundary
+```mermaid
+flowchart TD
+    A[Raw dataset<br/>NORMAL / PNEUMONIA] --> B[Stratified split<br/>15% labeled / 70% unlabeled / 15% test]
 
----
+    B --> C[Labeled subset 15%]
+    B --> D[Unlabeled subset 70%]
+    B --> E[Test set 15%, held out]
+    B --> F[Full pool with true labels<br/>100%, diagnostic only]
 
-## Repository Structure
+    C --> G[Supervised baseline<br/>ResNet-18]
+    G -- teacher --> H[Score unlabeled pool<br/>with confidence threshold]
+    D --> H
+    H --> I[Pseudo-labeled subset<br/>high confidence only]
+    C --> J[Retrain on<br/>labeled + pseudo-labeled]
+    I --> J
+
+    C --> K[FixMatch<br/>weak/strong consistency loss]
+    D --> K
+
+    F --> L[Fully supervised<br/>reference ceiling]
+
+    G --> M[Benchmark and visualize<br/>PR curves, confusion matrices, t-SNE/UMAP]
+    J --> M
+    K --> M
+    L --> M
+    E --> M
+
+    M --> N[Gradio demo<br/>model picker + live inference]
+
+    style G fill:#dbeafe
+    style J fill:#fef3c7
+    style K fill:#fef3c7
+    style L fill:#dcfce7
+    style M fill:#f3e8ff
+    style N fill:#fee2e2
+```
+
+Blue is the supervised baseline, yellow the SSL techniques, green the reference ceiling, purple evaluation, red deployment. GitHub renders this diagram natively. If you want a standalone image, paste the source into [Mermaid Live Editor](https://mermaid.live) and export a PNG or SVG.
+
+## Repository structure
 
 ```
 ssl_project/
-├── README.md                      <- you are here
-├── README_day1.md                 <- data prep & baseline: detailed run guide
-├── README_day2.md                 <- pseudo-labeling: detailed run guide
-├── README_day3.md                 <- FixMatch: detailed run guide
-├── README_day4.md                 <- benchmarking & visualization: detailed run guide
+├── README.md
+├── README_day1.md      data prep & baseline, detailed run guide
+├── README_day2.md      pseudo-labeling, detailed run guide
+├── README_day3.md      FixMatch, detailed run guide
+├── README_day4.md      benchmarking & visualization, detailed run guide
+├── README_day5.md      demo deployment & ablation, detailed run guide
 ├── requirements.txt
 ├── src/
-│   ├── utils.py                   <- seeding, metrics, early stopping
-│   ├── dataset.py                 <- manifest-based image Dataset + transforms
-│   ├── prepare_data.py            <- builds the 15/70/15 stratified split
-│   ├── train_baseline.py          <- Day 1: supervised baseline (ResNet-18)
-│   ├── generate_pseudo_labels.py  <- Day 2: teacher inference + confidence filter
-│   ├── analyze_pseudo_labels.py   <- Day 2: threshold sweep diagnostic
-│   ├── train_pseudolabel.py       <- Day 2: retrain on labeled + pseudo-labeled
-│   ├── augmentations.py           <- Day 3: weak/strong augmentation pipelines
-│   ├── dataset_fixmatch.py        <- Day 3: dual-view unlabeled dataset
-│   ├── train_fixmatch.py          <- Day 3: FixMatch training loop
-│   ├── train_full_supervised.py   <- Day 4: 100%-labeled reference ceiling
-│   ├── benchmark.py               <- Day 4: aggregate metrics, comparison table + chart
-│   ├── plot_pr_confusion.py       <- Day 4: precision-recall curves + confusion matrices
-│   └── plot_embeddings.py         <- Day 4: t-SNE/UMAP feature embedding comparison
+│   ├── utils.py                   seeding, metrics, early stopping
+│   ├── dataset.py                 manifest-based image Dataset + transforms
+│   ├── prepare_data.py            builds the 15/70/15 stratified split
+│   ├── train_baseline.py          supervised baseline (ResNet-18)
+│   ├── generate_pseudo_labels.py  teacher inference + confidence filter
+│   ├── analyze_pseudo_labels.py   threshold sweep diagnostic
+│   ├── train_pseudolabel.py       retrain on labeled + pseudo-labeled
+│   ├── augmentations.py           weak/strong augmentation pipelines
+│   ├── dataset_fixmatch.py        dual-view unlabeled dataset
+│   ├── train_fixmatch.py          FixMatch training loop
+│   ├── train_full_supervised.py   100%-labeled reference ceiling
+│   ├── benchmark.py               aggregate metrics into a comparison table + chart
+│   ├── plot_pr_confusion.py       precision-recall curves + confusion matrices
+│   ├── plot_embeddings.py         t-SNE/UMAP feature embedding comparison
+│   ├── app.py                     Gradio interactive demo
+│   └── run_ablation.py            hyperparameter ablation sweep runner
 └── outputs/
-    ├── manifests/                  <- CSV manifests for each split (generated)
-    ├── checkpoints/                <- saved model weights (generated)
-    ├── figures/                    <- diagnostic plots (generated)
-    └── comparison_table.csv        <- aggregated benchmark results (generated)
+    ├── manifests/       CSV manifests for each split (generated)
+    ├── checkpoints/     saved model weights (generated)
+    ├── figures/         diagnostic plots (generated)
+    └── comparison_table.csv   aggregated benchmark results (generated)
 ```
 
----
+## Getting started
 
-## Reproducing Results
-
-Requires a GPU (Colab's free T4 tier is sufficient). See the per-stage
-READMEs for full detail and troubleshooting; the short version:
+You'll need a GPU for reasonable training speed. Google Colab's free T4 tier works fine, and Kaggle Notebooks is convenient since the dataset is already hosted there.
 
 ```bash
 pip install -r requirements.txt
 
-# 1. Baseline
+# 1. Data prep and baseline
 python src/prepare_data.py --data_root data/raw --out_dir outputs/manifests \
     --labeled_frac 0.15 --test_frac 0.15 --seed 42
 python src/train_baseline.py --manifest_dir outputs/manifests --epochs 15
@@ -203,7 +147,7 @@ python src/train_pseudolabel.py --manifest_dir outputs/manifests --epochs 15
 python src/train_fixmatch.py --manifest_dir outputs/manifests --epochs 15 \
     --batch_size_labeled 16 --mu 3 --threshold 0.95 --lambda_u 1.0
 
-# 4. Fully supervised ceiling + benchmarking
+# 4. Fully supervised ceiling and benchmarking
 python src/train_full_supervised.py --manifest_dir outputs/manifests --epochs 15
 python src/benchmark.py --outputs_dir outputs
 python src/plot_pr_confusion.py --manifest_dir outputs/manifests
@@ -211,71 +155,56 @@ python src/plot_embeddings.py --manifest_dir outputs/manifests \
     --model_a_ckpt outputs/checkpoints/baseline_best.pt --model_a_label "Baseline (15%)" \
     --model_b_ckpt outputs/checkpoints/fixmatch_best.pt --model_b_label "FixMatch" \
     --method tsne
+
+# 5. Demo
+python src/app.py --ckpt_dir outputs/checkpoints
 ```
 
-Each stage writes its own `metrics_*.json` to `outputs/`; `benchmark.py`
-aggregates all four into the comparison table below and prints a
-ready-to-paste markdown version.
+Each training script writes its own `metrics_*.json` to `outputs/`. `benchmark.py` pulls all of them together into a comparison table and chart, and also prints a markdown table you can drop straight into a writeup.
 
----
+See the per-day READMEs for the full detail, troubleshooting notes, and what to watch for at each stage (things like the pseudo-label accuracy vs. coverage tradeoff, or FixMatch's mask rate during training).
 
-## Results
+## Interactive demo
 
-*Pending full training run — see [Status](#status). All four training and
-benchmarking scripts are implemented and syntax-verified; the table below
-will be replaced with `benchmark.py`'s real output (and the figures listed
-after it) once a full GPU run completes.*
+`src/app.py` runs a small Gradio app. Upload a chest X-ray, pick a model from the dropdown, see the predicted class and confidence. The dropdown is really the point of the demo: switching between the 15%-labeled baseline and an SSL-trained model on the same image makes the effect of the unlabeled data visible instead of abstract.
 
-| Setup | Labeled Data Used | Accuracy | F1 | Precision | Recall |
-|---|---|---|---|---|---|
-| Supervised baseline | 15% | — | — | — | — |
-| Pseudo-labeling | 15% + high-conf pseudo | — | — | — | — |
-| FixMatch | 15% + consistency-regularized | — | — | — | — |
-| Fully supervised (reference ceiling) | 100% | — | — | — | — |
+```bash
+python src/app.py --ckpt_dir outputs/checkpoints
+```
 
-**Figures** (generated by `plot_pr_confusion.py` and `plot_embeddings.py`,
-to be embedded here once available):
-- `benchmark_comparison.png` — grouped bar chart, all metrics × all setups
-- `precision_recall_curves.png` — PR curves overlaid, all four setups
-- `confusion_matrices.png` — side-by-side confusion matrices
-- `embeddings_tsne.png` — baseline vs. SSL feature representation comparison
+`README_day5.md` covers deploying it publicly to Hugging Face Spaces if you want a shareable link.
 
-Additional diagnostics tracked per SSL stage:
-- **Pseudo-label accuracy** at the chosen confidence threshold (Day 2 &
-  Day 3), to quantify how much the confidence filter actually improves
-  label quality over the teacher's raw accuracy
-- **Coverage vs. accuracy tradeoff** across a threshold sweep (Day 2)
-- **Mask rate** (fraction of unlabeled batch used) and pseudo-label
-  accuracy trend across training epochs (Day 3)
-- **Percent of the labeling-cost gap closed**: `(SSL score − baseline
-  score) / (fully-supervised score − baseline score)`, computed once real
-  numbers are in — this is the single most recruiter-legible statistic in
-  the whole project, since it directly answers "was the SSL technique
-  worth it."
+## Ablation study
 
----
+`src/run_ablation.py` sweeps a chosen hyperparameter, retraining at each value and aggregating the results. Two sweeps are built in: the pseudo-labeling confidence threshold, and FixMatch's consistency loss weight (`lambda_u`). This is what justifies the project's default choices instead of just asserting them.
 
-## Tech Stack
+```bash
+python src/run_ablation.py --sweep pseudolabel_threshold \
+    --values 0.8 0.9 0.95 0.99 --manifest_dir outputs/manifests --epochs 8
 
-- **Model**: ResNet-18 (ImageNet-pretrained backbone, fine-tuned)
-- **Framework**: PyTorch + torchvision
-- **Augmentation**: torchvision `RandAugment`, `RandomErasing`
-- **Evaluation**: scikit-learn (accuracy, F1, precision, recall, confusion
-  matrix, precision-recall curves), matplotlib for benchmarking plots
-- **Feature visualization**: scikit-learn t-SNE / UMAP on penultimate-layer embeddings
-- **Planned (Day 5)**: Gradio for the interactive demo app
+python src/run_ablation.py --sweep fixmatch_lambda_u \
+    --values 0.25 0.5 1.0 2.0 --manifest_dir outputs/manifests --epochs 8
+```
+
+## Tech stack
+
+- Model: ResNet-18, ImageNet-pretrained backbone, fine-tuned
+- Framework: PyTorch and torchvision
+- Augmentation: torchvision's RandAugment and RandomErasing
+- Evaluation: scikit-learn (accuracy, F1, precision, recall, confusion matrix, PR curves), matplotlib for plots
+- Feature visualization: scikit-learn t-SNE / UMAP on penultimate-layer embeddings
+- Demo: Gradio, deployable to Hugging Face Spaces
 
 ## Limitations
 
-- Results reported here reflect a single train/val/test split and a single
-  random seed; a production-grade evaluation would average over multiple
-  seeds and report variance.
-- The confidence threshold (0.95) and FixMatch's `λ_u`/`μ` hyperparameters
-  were chosen based on common defaults from the literature, not an
-  exhaustive search. The threshold sweep (Day 2) and benchmarking scripts
-  (Day 4) exist to interrogate these choices, but neither has been run
-  across multiple hyperparameter settings yet — that would be a natural
-  extension beyond the current 5-day scope.
-- This is trained on a single public dataset with known class imbalance;
-  conclusions about SSL's effectiveness here shouldn't be assumed to
-  generalize to other medical imaging tasks without re-validation.
+Results here reflect a single train/val/test split and a single random seed. A more rigorous evaluation would average over several seeds and report variance instead of a point estimate.
+
+The confidence threshold (0.95) and FixMatch's `lambda_u`/`mu` values are common defaults from the literature, not the result of an exhaustive search. The ablation runner exists to interrogate these choices, but hasn't been run across a full hyperparameter grid.
+
+This was trained on a single public dataset with a known class imbalance. Conclusions about how well SSL works here shouldn't be assumed to carry over to other medical imaging tasks without re-checking.
+
+## Possible extensions
+
+- MixMatch or Mean Teacher as additional SSL baselines to compare against FixMatch
+- A multi-seed evaluation to report variance rather than a single number
+- A second domain, like financial document classification, to see how well these findings generalize outside medical imaging
